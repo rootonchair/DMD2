@@ -1,0 +1,13 @@
+# Separate environment from the legacy SDXL/SD1.5 requirements.
+# This Diffusers commit supplies both native pipelines and is the tested revision.
+torch>=2.4
+git+https://github.com/huggingface/diffusers.git@0121a91f9d419ff7234c8a5923f82c244e6f1914
+transformers==5.17.0
+accelerate==1.15.0
+peft==0.21.2
+safetensors>=0.5
+huggingface-hub>=1.0
+pillow>=10
+numpy>=1.24
+pytest>=8
+datasets>=5.0

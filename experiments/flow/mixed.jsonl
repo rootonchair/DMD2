@@ -1,0 +1,2 @@
+{"task":"t2i","prompt":"A mountain lake at sunset, natural light, detailed landscape photograph","reference_images":[]}
+{"task":"i2i","prompt":"Change the jacket to red while preserving the person and background","reference_images":["images/person.png"]}

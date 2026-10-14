@@ -181,5 +181,28 @@ wandb
 *.npz
 ignored_cache
 
+# Local datasets and training artifacts.
+/data/
+/outputs/
+
+# Machine-local handover notes and execution reports.
+/HANDOVER.md
+/experiments/flow/RUN_RESULTS.md
+/experiments/flow/T2I_RUN.md
+/experiments/flow/VALIDATION.md
+
+# Credentials and downloaded model/optimizer tensors.
+.env.*
+!.env.example
+!.env.template
+.ssh/
+*.pem
+*.key
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+
 *.jpg
 *.png

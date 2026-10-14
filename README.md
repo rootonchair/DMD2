@@ -196,6 +196,13 @@ Pretrained models can be found in [ImageNet](experiments/imagenet/README.md) and
 
 ## Training and Evaluation 
 
+### FLUX.2 Klein and Qwen-Image-2.1
+
+The [flow distillation backend](experiments/flow/README.md) supports text-to-image and
+reference-image editing, one-step/four-step students, LoRA/full-weight training, and
+checkpoint resume. It uses distribution matching without GAN loss and has separate
+dependencies in `requirements-flow.txt`.
+
 ### ImageNet-64x64 
 
 Please refer to [ImageNet-64x64](experiments/imagenet/README.md) for details.
