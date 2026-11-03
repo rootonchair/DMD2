@@ -15,6 +15,9 @@ MODEL_IDS = {
     'flux_klein': 'black-forest-labs/FLUX.2-klein-base-4B',
     'qwen_image21': 'Qwen/Qwen-Image-2.1',
 }
+NATIVE_SCHEDULE_POLICY = 'native-linear-sigmas-v1'
+QWEN_DISTILL_SCHEDULE_POLICY = 'qwen-no-terminal-sigmas-v1'
+SCHEDULE_POLICIES = (NATIVE_SCHEDULE_POLICY, QWEN_DISTILL_SCHEDULE_POLICY)
 
 
 def resolve_revision(model_id, revision=None):
@@ -33,6 +36,8 @@ class FlowAdapter:
                  teacher_guidance=None, scheduler_config=None):
         import diffusers
         from diffusers import Flux2KleinPipeline, QwenImage21Pipeline
+        from huggingface_hub.constants import HF_HUB_OFFLINE
+        self.local_files_only = HF_HUB_OFFLINE
         self.family = family
         self.model_id = model_id or MODEL_IDS[family]
         self.revision = resolve_revision(self.model_id, revision)
@@ -40,11 +45,14 @@ class FlowAdapter:
         self.dtype = dtype
         self.teacher_guidance = teacher_guidance if teacher_guidance is not None else (4.0 if family == 'flux_klein' else 1.0)
         self.saved_schedules = {}
+        self.schedule_policy = NATIVE_SCHEDULE_POLICY
         self.keep_encoders_on_device = False
         cls = Flux2KleinPipeline if family == 'flux_klein' else QwenImage21Pipeline
-        self.pipe = cls.from_pretrained(self.model_id, revision=self.revision, torch_dtype=dtype, transformer=None)
+        self.pipe = cls.from_pretrained(self.model_id, revision=self.revision, torch_dtype=dtype, transformer=None,
+                                        local_files_only=self.local_files_only)
         self.transformer_class = diffusers.Flux2Transformer2DModel if family == 'flux_klein' else diffusers.QwenImage21Transformer2DModel
-        self.transformer_config = self.transformer_class.load_config(self.model_id, subfolder='transformer', revision=self.revision)
+        self.transformer_config = self.transformer_class.load_config(self.model_id, subfolder='transformer', revision=self.revision,
+                                                                     local_files_only=self.local_files_only)
         if scheduler_config is not None:
             self.pipe.scheduler = self.pipe.scheduler.__class__.from_config(scheduler_config)
         for component in (self.pipe.text_encoder, self.pipe.vae):
@@ -64,7 +72,8 @@ class FlowAdapter:
 
     def load_transformer(self):
         return self.transformer_class.from_pretrained(
-            self.model_id, subfolder='transformer', revision=self.revision, torch_dtype=self.dtype
+            self.model_id, subfolder='transformer', revision=self.revision, torch_dtype=self.dtype,
+            local_files_only=getattr(self, 'local_files_only', False)
         ).to(self.device)
 
     def offload_encoders(self):
@@ -75,7 +84,7 @@ class FlowAdapter:
 
     def metadata(self):
         return dict(self.identity, scheduler_config=dict(self.pipe.scheduler.config),
-                    schedule_policy='native-linear-sigmas-v1')
+                    schedule_policy=getattr(self, 'schedule_policy', NATIVE_SCHEDULE_POLICY))
 
     @torch.no_grad()
     def prepare(self, record):
@@ -156,7 +165,17 @@ class FlowAdapter:
             return torch.tensor([1.0, 0.0], device=self.device)
         from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu
         from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_shift
-        scheduler = self.pipe.scheduler.__class__.from_config(self.pipe.scheduler.config)
+        policy = getattr(self, 'schedule_policy', NATIVE_SCHEDULE_POLICY)
+        if policy not in SCHEDULE_POLICIES:
+            raise ValueError(f'Unsupported student schedule policy: {policy}')
+        overrides = {}
+        if policy == QWEN_DISTILL_SCHEDULE_POLICY:
+            if self.family != 'qwen_image21':
+                raise ValueError('The Qwen student schedule policy requires qwen_image21')
+            # Only the student rollout disables terminal stretching. Keep the
+            # pipeline scheduler unchanged for native 40-step teacher references.
+            overrides['shift_terminal'] = None
+        scheduler = self.pipe.scheduler.__class__.from_config(self.pipe.scheduler.config, **overrides)
         length = sample['shape'][1]
         if self.family == 'flux_klein':
             mu = compute_empirical_mu(length, num_steps)
@@ -174,7 +193,8 @@ class FlowAdapter:
             raise ValueError('Native sigma schedule must be finite and strictly decreasing')
         return scheduler.sigmas.to(self.device).float()
 
-    def predict(self, transformer, latents, sigma, condition, guidance_scale=1.0):
+    def predict(self, transformer, latents, sigma, condition, guidance_scale=1.0, return_branches=False):
+        """Velocity prediction; return_branches=True gives (conditional, unconditional) unguided."""
         # Accept Accelerate/DDP-wrapped models without accessing wrapper dtype.
         parameter = next(transformer.parameters())
         dtype, device = parameter.dtype, parameter.device
@@ -200,12 +220,28 @@ class FlowAdapter:
                     encoder_hidden_states_mask=condition['negative_prompt_mask' if negative else 'prompt_mask'],
                     img_mask=condition['negative_image_mask' if negative else 'image_mask'])[0][:, -state.shape[1]:]
         predicted = forward()
-        if guidance_scale > 1:
+        if guidance_scale > 1 or return_branches:
             if condition.get('negative_prompt_embeds') is None:
                 raise ValueError('Guided teacher predictions require cached negative conditioning')
             uncond = forward(True)
+            if return_branches:
+                return predicted, uncond
             predicted = uncond + guidance_scale * (predicted - uncond)
         return predicted
+
+    @torch.no_grad()
+    def encode(self, pixels):
+        """Inverse of decode for real images: [-1, 1] RGB (B, 3, H, W) -> packed normalized latents."""
+        if self.family != 'qwen_image21':
+            raise ValueError('Real-image latent encoding is implemented for qwen_image21 only')
+        self.pipe.vae.to(self.device)
+        pixels = pixels.to(device=self.device, dtype=self.pipe.vae.dtype)
+        if self.pipe.vae.config.get('in_channels', 3) == 4 and pixels.shape[1] == 3:
+            # Qwen Image 2.1 encodes RGBA (prepare() converts references to RGBA); real photos are opaque.
+            pixels = torch.cat([pixels, torch.ones_like(pixels[:, :1])], dim=1)
+        latents = self.pipe._encode_vae_image(pixels[:, :, None], None)
+        batch, channels, _, height, width = latents.shape
+        return self.pipe._pack_latents(latents, batch, channels, height, width).float()
 
     @torch.no_grad()
     def decode(self, latents, sample):

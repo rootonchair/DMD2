@@ -1,4 +1,4 @@
-"""Distribution-matching distillation for flow models, without a GAN loss."""
+"""Distribution-matching distillation for flow models, optionally with DMD2's diffusion-GAN loss."""
 
 import argparse
 from contextlib import nullcontext
@@ -14,13 +14,16 @@ from accelerate.utils import DistributedType, set_seed
 from diffusers.optimization import get_scheduler
 import torch
 
-from main.flow.adapters import FlowAdapter, MODEL_IDS
+from main.flow.adapters import (FlowAdapter, MODEL_IDS, NATIVE_SCHEDULE_POLICY,
+                                QWEN_DISTILL_SCHEDULE_POLICY, SCHEDULE_POLICIES)
 from main.flow.checkpoints import configure_trainable, export_model, prune_checkpoints, register_compact_lora_hooks
 from main.flow.data import CachedConditioning, OnDemandConditioning, cache_key, prepare_cache, read_manifest
 from main.flow.losses import distillation_loss, fake_score_loss, interpolate, sample_score_sigma, student_clean_sample
 from main.flow.ema import StudentEMA
+from main.flow.gan import (DiscriminatorHead, RealLatents, discriminator_gan_loss, frozen, generator_gan_loss,
+                           generator_gradient_diagnostics, realism_logits, restore_real_sampler, target_grid, unwrap)
 from main.flow.validation import evaluate_student
-from main.flow.comparisons import prepare_flux_teacher_references
+from main.flow.comparisons import prepare_teacher_references
 
 
 @lru_cache(maxsize=2)
@@ -51,6 +54,8 @@ def parse_args(argv=None):
     parser.add_argument('--manifest', required=True)
     parser.add_argument('--task', choices=['t2i', 'i2i', 'mixed'], default='mixed')
     parser.add_argument('--num_steps', type=int, choices=[1, 4], default=4)
+    parser.add_argument('--student_schedule_policy', choices=SCHEDULE_POLICIES, default=NATIVE_SCHEDULE_POLICY,
+                        help='Student sigma grid only; Qwen few-step distillation should disable terminal stretching')
     parser.add_argument('--student_train_mode', choices=['lora', 'full'], default='lora')
     parser.add_argument('--fake_train_mode', choices=['lora', 'full'], default='lora')
     parser.add_argument('--lora_rank', type=int, default=32)
@@ -70,6 +75,8 @@ def parse_args(argv=None):
     parser.add_argument('--warmup_step', type=int, default=0,
                         help='Linear LR warm-up for both optimizers; original DMD2 uses 500 (0 preserves legacy constant LR)')
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
+    parser.add_argument('--adam_betas', type=float, nargs=2, default=[0.9, 0.999], metavar=('BETA1', 'BETA2'),
+                        help='AdamW betas for both student and critic; DMD2/FastVideo use 0 0.999')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--cache_dir')
@@ -92,11 +99,38 @@ def parse_args(argv=None):
                         help='Legacy uniform sigma .02-.98 or FastVideo shifted integer timesteps over the full range')
     parser.add_argument('--score_noise_shift', type=float, default=8.0,
                         help='Rational timestep shift for shifted score-noise sampling (FastVideo Wan: 8)')
+    parser.add_argument('--dmd_guidance_mode', choices=['combined', 'decoupled'], default='combined',
+                        help='combined: DMD against the CFG teacher; decoupled: conditional distribution matching plus '
+                             'a separately scored (w-1)(cond-uncond) CFG-augmentation term (Decoupled DMD)')
+    parser.add_argument('--cfg_term_weight', type=float, default=1.0,
+                        help='Decoupled mode only: weight of the CFG-augmentation term (0 gives pure distribution matching)')
+    parser.add_argument('--cfg_noise_min', type=float, default=0.0,
+                        help='Decoupled mode only: lower bound of the CFG term sigma range')
+    parser.add_argument('--cfg_noise_max', type=float, default=1.0,
+                        help='Decoupled mode only: upper bound; score-noise samples are mapped into [min, max]')
     parser.add_argument('--student_ema_decay', type=float, default=0.0,
                         help='Student EMA decay, updated every outer iteration from the start; 0 disables, FastVideo uses .98')
+    parser.add_argument('--gan_real_latents', nargs='+',
+                        help='Real-photo latents from main/prepare_flow_real_latents.py for the DMD2 GAN loss')
+    parser.add_argument('--gen_cls_loss_weight', type=float, default=0.0,
+                        help='Generator GAN weight; the authors\' SDXL recipes use 5e-3 (0 disables the GAN)')
+    parser.add_argument('--guidance_cls_loss_weight', type=float, default=0.0,
+                        help='Discriminator weight added to the fake-score loss; authors\' SDXL recipes use 1e-2')
+    parser.add_argument('--gan_feature_block', type=int,
+                        help='Transformer blocks run before the discriminator head; default is half the depth '
+                             '(the authors classify UNet mid-block features)')
+    parser.add_argument('--diffusion_gan_max_timestep', type=int, default=1000,
+                        help='DDPM timesteps [0, N) for discriminator inputs, mapped to equal-SNR flow sigmas')
+    parser.add_argument('--gan_head_width', type=int, default=1280)
+    parser.add_argument('--gan_gradient_diagnostics_every', type=int, default=0,
+                        help='Report GAN/DMD latent gradient norms on the first and every Nth student update '
+                             '(first record of first microbatch only; 0 disables)')
+    parser.add_argument('--real_cache_dir', help='Conditioning cache for real-photo captions; defaults to <cache_dir>-real')
     parser.add_argument('--pilot_fixed_noise', action='store_true',
                         help='Separate reproducible rollout/selection/scoring RNG streams for controlled pilots')
     args = parser.parse_args(argv)
+    if args.student_schedule_policy == QWEN_DISTILL_SCHEDULE_POLICY and args.model_family != 'qwen_image21':
+        parser.error('The Qwen student schedule policy requires --model_family qwen_image21')
     if args.conditioning_cache_limit is not None and args.conditioning_cache_limit < 1:
         parser.error('--conditioning_cache_limit must be positive')
     for name in ('fake_lora_rank', 'fake_lora_alpha'):
@@ -108,29 +142,49 @@ def parse_args(argv=None):
                  'lora_alpha', 'save_every', 'log_every'):
         if getattr(args, name) < 1:
             parser.error(f'--{name} must be positive')
+    if not (0 <= args.adam_betas[0] < 1 and 0 <= args.adam_betas[1] < 1):
+        parser.error('--adam_betas must be in [0, 1)')
     if args.max_grad_norm <= 0:
         parser.error('--max_grad_norm must be positive')
     if args.warmup_step < 0:
         parser.error('--warmup_step must be nonnegative')
     if not 0 < args.score_noise_shift < float('inf'):
         parser.error('--score_noise_shift must be finite and positive')
+    if args.cfg_term_weight < 0:
+        parser.error('--cfg_term_weight must be nonnegative')
+    if not 0 <= args.cfg_noise_min < args.cfg_noise_max <= 1:
+        parser.error('CFG term sigma range must satisfy 0 <= --cfg_noise_min < --cfg_noise_max <= 1')
+    if args.dmd_guidance_mode == 'combined' and (args.cfg_term_weight, args.cfg_noise_min, args.cfg_noise_max) != (1.0, 0.0, 1.0):
+        parser.error('CFG term weight and sigma range require --dmd_guidance_mode decoupled')
     if not 0 <= args.student_ema_decay < 1:
         parser.error('--student_ema_decay must be in [0, 1)')
     if args.keep_checkpoints is not None and args.keep_checkpoints < 1:
         parser.error('--keep_checkpoints must be positive')
     if args.validation_every < 1 or args.validation_limit < 1 or args.fake_warmup_iters < 0:
         parser.error('Validation sizes/interval must be positive and fake warmup nonnegative')
-    if args.validation_manifest and args.resume:
-        parser.error('Quality pilots require fresh initialization so their baseline is the untrained base')
     if args.sampling_precision == 'native' and args.model_family != 'flux_klein':
         parser.error('Native carry/timestep policy is currently validated for FLUX Klein only')
     for name in ('student_lr', 'fake_lr'):
         if getattr(args, name) is not None and getattr(args, name) <= 0:
             parser.error(f'--{name} must be positive')
+    if args.gen_cls_loss_weight < 0 or args.guidance_cls_loss_weight < 0:
+        parser.error('GAN loss weights must be nonnegative')
+    args.use_gan = bool(args.gen_cls_loss_weight or args.guidance_cls_loss_weight)
+    if args.gan_gradient_diagnostics_every < 0 or (args.gan_gradient_diagnostics_every and not args.gen_cls_loss_weight):
+        parser.error('--gan_gradient_diagnostics_every must be nonnegative and requires a positive generator GAN weight')
+    if args.use_gan and not args.gan_real_latents:
+        parser.error('The GAN loss needs --gan_real_latents')
+    if args.use_gan and (args.task != 't2i' or args.model_family != 'qwen_image21'):
+        parser.error('The GAN loss is implemented for qwen_image21 text-to-image')
+    if not args.use_gan and (args.gan_real_latents or args.gan_feature_block):
+        parser.error('Real latents and feature block require a positive GAN loss weight')
+    if not 1 <= args.diffusion_gan_max_timestep <= 1000 or args.gan_head_width < 32 or args.gan_head_width % 32:
+        parser.error('--diffusion_gan_max_timestep must be in [1, 1000] and --gan_head_width a multiple of 32')
     if args.teacher_guidance is not None and args.teacher_guidance < 1:
         parser.error('--teacher_guidance must be >= 1')
     args.model_id = args.model_id or MODEL_IDS[args.model_family]
     args.cache_dir = args.cache_dir or str(Path(args.output_dir) / 'conditioning_cache')
+    args.real_cache_dir = args.real_cache_dir or (args.cache_dir.rstrip('/') + '-real' if args.use_gan else None)
     args.student_lr = args.student_lr or (1e-5 if args.student_train_mode == 'lora' else 5e-7)
     args.fake_lr = args.fake_lr or (1e-5 if args.fake_train_mode == 'lora' else 5e-7)
     return args
@@ -150,8 +204,12 @@ def resume_config_matches(saved, current):
     if saved.get('sampling_precision', 'fp32') != current.get('sampling_precision', 'fp32'):
         differences.append('sampling_precision')
     for name, default in [('rollout_mode', 'euler'), ('pilot_fixed_noise', False),
+                          ('student_schedule_policy', NATIVE_SCHEDULE_POLICY),
                           ('score_noise_sampling', 'uniform'), ('score_noise_shift', 8.0),
-                          ('student_ema_decay', 0.0)]:
+                          ('student_ema_decay', 0.0), ('dmd_guidance_mode', 'combined'), ('adam_betas', [0.9, 0.999]),
+                          ('cfg_term_weight', 1.0), ('cfg_noise_min', 0.0), ('cfg_noise_max', 1.0),
+                          ('gen_cls_loss_weight', 0.0), ('guidance_cls_loss_weight', 0.0), ('gan_feature_block', None),
+                          ('diffusion_gan_max_timestep', 1000), ('gan_head_width', 1280), ('gan_real_latents', None)]:
         if saved.get(name, default) != current.get(name, default):
             differences.append(name)
     for name, fallback in [('fake_lora_rank', 'lora_rank'), ('fake_lora_alpha', 'lora_alpha')]:
@@ -159,6 +217,25 @@ def resume_config_matches(saved, current):
             differences.append(name)
     if differences:
         raise ValueError(f'Resume configuration differs for: {", ".join(differences)}')
+
+
+def resume_validation_baseline(saved, current, directory, records):
+    """Keep the original untrained baseline and held-out protocol across continuations."""
+    for name in ('validation_manifest', 'validation_every', 'validation_limit', 'validation_seeds'):
+        if saved.get(name) != current.get(name):
+            raise ValueError(f'Resume validation differs for: {name}')
+    path = Path(directory) / 'validation-000000/summary.json'
+    report = json.loads(path.read_text())
+    expected = [(index, seed) for index in range(len(records)) for seed in current['validation_seeds']]
+    rows = report['results']
+    if not report['completed'] or len(rows) != len(expected):
+        raise ValueError('Resume requires the complete original validation baseline')
+    for row, (index, seed) in zip(rows, expected):
+        record = records[index]
+        if ((row['index'], row['seed']) != (index, seed) or row['prompt'] != record['prompt']
+                or row['reference_images'] != record['reference_images'] or not Path(row['image']).is_file()):
+            raise ValueError('Resume validation baseline inputs or images differ')
+    return rows
 
 
 def main(argv=None):
@@ -188,10 +265,14 @@ def main(argv=None):
                           teacher_guidance=args.teacher_guidance)
     args.revision = adapter.revision
     args.teacher_guidance = adapter.teacher_guidance
+    adapter.schedule_policy = args.student_schedule_policy
     adapter.sampling_precision = args.sampling_precision
     adapter.rollout_mode = args.rollout_mode
     adapter.score_noise_sampling = args.score_noise_sampling
     adapter.score_noise_shift = args.score_noise_shift
+    adapter.dmd_guidance_mode = args.dmd_guidance_mode
+    adapter.cfg_term_weight = args.cfg_term_weight
+    adapter.cfg_noise_min, adapter.cfg_noise_max = args.cfg_noise_min, args.cfg_noise_max
     if accelerator.is_main_process and not args.conditioning_cache_limit:
         prepare_cache(adapter, records, args.cache_dir)
     accelerator.wait_for_everyone()
@@ -212,8 +293,29 @@ def main(argv=None):
                                   args.lora_alpha, not args.no_gradient_checkpointing)
     fake = configure_trainable(adapter.load_transformer(), args.fake_train_mode, args.fake_lora_rank,
                                args.fake_lora_alpha, not args.no_gradient_checkpointing)
-    student_optimizer = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=args.student_lr)
-    fake_optimizer = torch.optim.AdamW([p for p in fake.parameters() if p.requires_grad], lr=args.fake_lr)
+    head = real_latents = real_conditioning = None
+    if args.use_gan:
+        if accelerator.num_processes != 1:
+            raise ValueError('The GAN loss currently requires a single CUDA process')
+        config = unwrap(fake).config
+        args.gan_feature_block = args.gan_feature_block or config.num_layers // 2
+        if not 1 <= args.gan_feature_block <= config.num_layers:
+            raise ValueError(f'--gan_feature_block must be in [1, {config.num_layers}]')
+        head = DiscriminatorHead(config.num_attention_heads * config.attention_head_dim,
+                                 target_grid(dataset[0]['condition']), args.gan_head_width).to(accelerator.device).train()
+        real_latents = RealLatents(args.gan_real_latents)
+        if [1, *real_latents.latent(0).shape[1:]] != list(dataset[0]['shape']) or (real_latents.height, real_latents.width) != (args.height, args.width):
+            raise ValueError('Real latents must match the training resolution and latent layout')
+        real_records = real_latents.records()
+        real_paths = [Path(args.real_cache_dir) / (cache_key(record, adapter.identity) + '.pt') for record in real_records]
+        Path(args.real_cache_dir).mkdir(parents=True, exist_ok=True)
+        real_conditioning = OnDemandConditioning(adapter, real_records, real_paths, args.conditioning_cache_limit or 512)
+        real_generator = torch.Generator().manual_seed(args.seed + 1_000_003)
+    betas = tuple(args.adam_betas)
+    student_optimizer = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=args.student_lr, betas=betas)
+    # The authors' guidance optimizer trains the fake score and the classifier head together.
+    fake_parameters = [p for p in fake.parameters() if p.requires_grad] + (list(head.parameters()) if head is not None else [])
+    fake_optimizer = torch.optim.AdamW(fake_parameters, lr=args.fake_lr, betas=betas)
     student_scheduler = fake_scheduler = None
     if args.warmup_step:
         student_scheduler = get_scheduler('constant_with_warmup', optimizer=student_optimizer,
@@ -227,10 +329,14 @@ def main(argv=None):
     student_ema = StudentEMA(accelerator.unwrap_model(student), args.student_ema_decay) if args.student_ema_decay else None
     if student_ema is not None:
         accelerator.register_for_checkpointing(student_ema)
+    if head is not None:
+        accelerator.register_for_checkpointing(head)
     metadata = dict(adapter.metadata(), num_steps=args.num_steps, task=args.task, height=args.height, width=args.width,
                     teacher_guidance=args.teacher_guidance, sampling_precision=args.sampling_precision,
                     rollout_mode=args.rollout_mode, score_noise_sampling=args.score_noise_sampling,
-                    score_noise_shift=args.score_noise_shift, student_ema_decay=args.student_ema_decay)
+                    score_noise_shift=args.score_noise_shift, student_ema_decay=args.student_ema_decay,
+                    dmd_guidance_mode=args.dmd_guidance_mode, gen_cls_loss_weight=args.gen_cls_loss_weight,
+                    guidance_cls_loss_weight=args.guidance_cls_loss_weight)
     schedules = {}
     for index, record in enumerate(records):
         key = f'{record["height"]}x{record["width"]}:{args.num_steps}'
@@ -253,6 +359,10 @@ def main(argv=None):
                 raise ValueError(f'Resume requires unchanged {key}')
         accelerator.load_state(args.resume)
         start = json.loads((Path(args.resume) / 'progress.json').read_text())['completed_iterations']
+        if real_latents is not None:
+            method = restore_real_sampler(real_generator, args.resume, len(real_latents),
+                start * args.gradient_accumulation_steps * args.batch_size * bool(args.guidance_cls_loss_weight))
+            accelerator.print('REAL_SAMPLER_RESTORED', method, start)
     if start >= args.train_iters:
         raise ValueError('--train_iters must exceed the number of completed iterations')
     run_config['run_id'] = run_id
@@ -263,6 +373,10 @@ def main(argv=None):
         if accelerator.is_main_process:
             (directory / 'training_config.json').write_text(json.dumps(run_config, indent=2) + '\n')
             (directory / 'progress.json').write_text(json.dumps({'completed_iterations': completed}) + '\n')
+            if real_latents is not None:
+                torch.save(dict(state=real_generator.get_state(), examples=len(real_latents),
+                    draws=completed * args.gradient_accumulation_steps * args.batch_size * bool(args.guidance_cls_loss_weight)),
+                    directory / 'real_sampler_rng.pt')
             if not (directory / 'compact_lora.json').exists():
                 export_model(accelerator.unwrap_model(student), directory / 'student', metadata, args.student_train_mode)
             export_model(accelerator.unwrap_model(student), output / 'student', metadata, args.student_train_mode)
@@ -276,21 +390,28 @@ def main(argv=None):
         accelerator.wait_for_everyone()
 
     training_started = time.monotonic()
-    baseline = None
+    baseline = resume_validation_baseline(saved, run_config, output, validation_records) if args.resume and validation_samples else None
     comparison_options = {}
-    if validation_samples and args.model_family == 'flux_klein' and args.task == 't2i':
-        comparison_options['teacher_references'] = prepare_flux_teacher_references(adapter, teacher,
+    if validation_samples and args.task == 't2i':
+        comparison_options['teacher_references'] = prepare_teacher_references(adapter, teacher,
             validation_records, output / 'teacher-references', args.validation_seeds)
-    if validation_samples:
+    if validation_samples and not args.resume:
         baseline_result = evaluate_student(adapter, accelerator.unwrap_model(student), validation_samples,
-            validation_records, output / 'validation-000000', args.validation_seeds, **comparison_options)
+            validation_records, output / 'validation-000000', args.validation_seeds,
+            num_steps=args.num_steps, **comparison_options)
         baseline = baseline_result['results']
         accelerator.print('PILOT_BASELINE_READY', len(baseline))
+    if args.resume:
+        accelerator.print('RESUME_READY', json.dumps(dict(completed_iterations=start,
+            completed_student_updates=max(0, (start - args.fake_warmup_iters + args.fake_gen_ratio - 1) // args.fake_gen_ratio),
+            student_ema_updates=student_ema.num_updates if student_ema is not None else 0,
+            student_lr=student_optimizer.param_groups[0]['lr'], fake_lr=fake_optimizer.param_groups[0]['lr'],
+            original_baseline_preserved=baseline is not None)))
     student_updates = max(0, (start - args.fake_warmup_iters + args.fake_gen_ratio - 1) // args.fake_gen_ratio)
     for iteration in range(start, args.train_iters):
         student_turn = iteration >= args.fake_warmup_iters and (iteration - args.fake_warmup_iters) % args.fake_gen_ratio == 0
         student_lr, fake_lr = student_optimizer.param_groups[0]['lr'], fake_optimizer.param_groups[0]['lr']
-        statistics = torch.zeros(3, device=accelerator.device)
+        statistics = torch.zeros(7, device=accelerator.device)
         student_parameter_gradient_norm = None
         fake_parameter_gradient_norm = None
         for microstep in range(args.gradient_accumulation_steps):
@@ -306,10 +427,32 @@ def main(argv=None):
                         if student_turn:
                             extra = dict(generator=generators['rollout'], scoring_generator=generators['dm'], selected_step=selected_step) if generators else {}
                             dm_loss, clean, gradient = distillation_loss(adapter, student, teacher, fake, sample,
-                                args.num_steps, args.teacher_guidance, **extra)
+                                args.num_steps, args.teacher_guidance, **extra, **({'keep_graph': True} if head is not None else {}))
                             if not torch.isfinite(dm_loss):
                                 raise FloatingPointError('Nonfinite student distribution-matching loss')
-                            accelerator.backward(dm_loss / args.batch_size)
+                            if head is not None and args.gen_cls_loss_weight:
+                                # Gradients reach the student through the discriminator, never D itself.
+                                with frozen(fake, head):
+                                    gen_cls_loss = generator_gan_loss(realism_logits(adapter, fake, head, clean.float(),
+                                        sample['condition'], args.gan_feature_block, max_timestep=args.diffusion_gan_max_timestep))
+                                    if not torch.isfinite(gen_cls_loss):
+                                        raise FloatingPointError('Nonfinite generator GAN loss')
+                                    if (args.gan_gradient_diagnostics_every and microstep == 0 and index == indices[0]
+                                            and (student_updates == 0 or
+                                                 (student_updates + 1) % args.gan_gradient_diagnostics_every == 0)):
+                                        diagnostics = dict(iteration=iteration + 1, student_update=student_updates + 1,
+                                            sample_index=index, microstep=microstep, scope='student_output_latent',
+                                            gen_cls_loss_weight=args.gen_cls_loss_weight,
+                                            **generator_gradient_diagnostics(dm_loss, gen_cls_loss, clean, args.gen_cls_loss_weight))
+                                        if accelerator.is_main_process:
+                                            with (output / 'gan_gradient_diagnostics.jsonl').open('a') as stream:
+                                                stream.write(json.dumps(diagnostics) + '\n')
+                                        accelerator.print('GAN_GRADIENT_DIAGNOSTICS', json.dumps(diagnostics))
+                                    accelerator.backward((dm_loss + args.gen_cls_loss_weight * gen_cls_loss) / args.batch_size)
+                                statistics[3] += gen_cls_loss.detach()
+                            else:
+                                accelerator.backward(dm_loss / args.batch_size)
+                            clean = clean.detach()
                             statistics[0] += dm_loss.detach()
                             statistics[2] += gradient.norm().detach()
                         else:
@@ -323,12 +466,27 @@ def main(argv=None):
                         fake_loss = fake_score_loss(fake_v, clean, noise)
                         if not torch.isfinite(fake_loss):
                             raise FloatingPointError('Nonfinite fake-score loss')
-                        accelerator.backward(fake_loss / args.batch_size)
+                        guidance_loss = fake_loss
+                        if head is not None and args.guidance_cls_loss_weight:
+                            real_index = int(torch.randint(len(real_latents), (), generator=real_generator))
+                            real_sample = real_conditioning[real_index]
+                            real_logits = realism_logits(adapter, fake, head, real_latents.latent(real_index).to(clean.device),
+                                real_sample['condition'], args.gan_feature_block, max_timestep=args.diffusion_gan_max_timestep)
+                            fake_logits = realism_logits(adapter, fake, head, clean.detach().float(), sample['condition'],
+                                args.gan_feature_block, max_timestep=args.diffusion_gan_max_timestep)
+                            guidance_cls_loss = discriminator_gan_loss(real_logits, fake_logits)
+                            if not torch.isfinite(guidance_cls_loss):
+                                raise FloatingPointError('Nonfinite discriminator GAN loss')
+                            guidance_loss = fake_loss + args.guidance_cls_loss_weight * guidance_cls_loss
+                            statistics[4] += guidance_cls_loss.detach()
+                            statistics[5] += torch.sigmoid(real_logits.detach()).mean()
+                            statistics[6] += torch.sigmoid(fake_logits.detach()).mean()
+                        accelerator.backward(guidance_loss / args.batch_size)
                         statistics[1] += fake_loss.detach()
                 if accelerator.sync_gradients:
                     if student_turn:
                         student_parameter_gradient_norm = accelerator.clip_grad_norm_(student.parameters(), args.max_grad_norm)
-                    fake_parameter_gradient_norm = accelerator.clip_grad_norm_(fake.parameters(), args.max_grad_norm)
+                    fake_parameter_gradient_norm = accelerator.clip_grad_norm_(fake_parameters, args.max_grad_norm)
                     if not torch.isfinite(fake_parameter_gradient_norm) or (student_turn and not torch.isfinite(student_parameter_gradient_norm)):
                         raise FloatingPointError('Nonfinite optimizer parameter gradient')
                 if student_turn:
@@ -348,7 +506,9 @@ def main(argv=None):
         student_updates += int(student_turn)
         if student_turn or completed % args.log_every == 0 or completed == 1:
             means = accelerator.reduce(statistics, reduction='mean') / (args.batch_size * args.gradient_accumulation_steps)
-            accelerator.print(json.dumps(dict(iteration=completed, student_updated=student_turn,
+            gan_log = dict(gen_cls_loss=float(means[3]), guidance_cls_loss=float(means[4]),
+                           pred_realism_on_real=float(means[5]), pred_realism_on_fake=float(means[6])) if head is not None else {}
+            accelerator.print(json.dumps(dict(iteration=completed, student_updated=student_turn, **gan_log,
                 dm_loss=float(means[0]), fake_loss=float(means[1]), dm_gradient_norm=float(means[2]),
                 student_parameter_gradient_norm=float(student_parameter_gradient_norm) if student_turn else None,
                 fake_parameter_gradient_norm=float(fake_parameter_gradient_norm),
@@ -361,10 +521,12 @@ def main(argv=None):
             with student_ema.apply(accelerator.unwrap_model(student)) if student_ema is not None else nullcontext():
                 validation = evaluate_student(adapter, accelerator.unwrap_model(student), validation_samples,
                     validation_records, output / f'validation-{completed:06d}', args.validation_seeds, baseline,
-                    weight_source='ema' if student_ema is not None else 'raw', **comparison_options)
+                    weight_source='ema' if student_ema is not None else 'raw', num_steps=args.num_steps,
+                    **comparison_options)
             with (output / 'validation_checks.jsonl').open('a') as stream:
                 stream.write(json.dumps(dict(completed_iterations=completed, completed_student_updates=student_updates,
                     artifact_gate_passed=validation['artifact_gate_passed'],
+                    color_drift_vs_teacher=validation.get('color_drift_vs_teacher'),
                     directory=str((output / f'validation-{completed:06d}').resolve()))) + '\n')
             accelerator.print('PILOT_VALIDATION', completed,
                               'PASS' if validation['artifact_gate_passed'] else 'ARTIFACT_WARNING')

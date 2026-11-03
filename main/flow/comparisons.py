@@ -1,10 +1,23 @@
-"""Prompt-labelled comparisons and reusable native FLUX teacher references."""
+"""Prompt-labelled comparisons and reusable native teacher references."""
 
 import json
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 import torch
+
+
+def native_teacher_steps(family):
+    return {'flux_klein': 50, 'qwen_image21': 40}[family]
+
+
+def native_teacher_guidance(family, scale):
+    if family == 'qwen_image21':
+        # Qwen requires both a scale and a non-None negative prompt to enable CFG.
+        return dict(true_cfg_scale=scale, negative_prompt='')
+    if family == 'flux_klein':
+        return dict(guidance_scale=scale)
+    raise ValueError(f'Unsupported native teacher family: {family}')
 
 
 def comparison_image(panels, prompt, seed, iteration=None):
@@ -59,13 +72,12 @@ def save_comparison(path, panels, prompt, seed, iteration=None):
 
 
 @torch.inference_mode()
-def prepare_flux_teacher_references(adapter, teacher, records, directory, seeds):
-    if adapter.family != 'flux_klein':
-        raise ValueError('Native teacher comparisons currently require FLUX Klein')
+def prepare_teacher_references(adapter, teacher, records, directory, seeds):
+    steps = native_teacher_steps(adapter.family)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     identity = dict(model_id=adapter.model_id, revision=adapter.revision,
-        teacher_guidance=adapter.teacher_guidance, teacher_steps=50, records=records, seeds=list(seeds))
+        teacher_guidance=adapter.teacher_guidance, teacher_steps=steps, records=records, seeds=list(seeds))
     summary_path = directory / 'summary.json'
     if summary_path.exists():
         previous = json.loads(summary_path.read_text())
@@ -90,13 +102,13 @@ def prepare_flux_teacher_references(adapter, teacher, records, directory, seeds)
                         with Image.open(reference) as source:
                             references.append(source.convert('RGB'))
                     image = adapter.pipe(prompt=record['prompt'], image=references or None,
-                        height=record['height'], width=record['width'], num_inference_steps=50,
-                        guidance_scale=adapter.teacher_guidance,
+                        height=record['height'], width=record['width'], num_inference_steps=steps,
+                        **native_teacher_guidance(adapter.family, adapter.teacher_guidance),
                         generator=torch.Generator(device=adapter.device).manual_seed(seed)).images[0]
                     path = directory / f'{index:03d}-seed{seed}.png'
                     image.save(path)
                     rows.append(dict(index=index, seed=seed, prompt=record['prompt'],
-                        reference_images=record['reference_images'], image=str(path.resolve()), teacher_steps=50))
+                        reference_images=record['reference_images'], image=str(path.resolve()), teacher_steps=steps))
                     temporary = summary_path.with_suffix('.tmp')
                     temporary.write_text(json.dumps(dict(identity=identity, completed=False, results=rows), indent=2) + '\n')
                     temporary.replace(summary_path)
@@ -107,3 +119,7 @@ def prepare_flux_teacher_references(adapter, teacher, records, directory, seeds)
         adapter.offload_encoders()
     summary_path.write_text(json.dumps(dict(identity=identity, completed=True, results=rows), indent=2) + '\n')
     return rows
+
+
+# Preserve existing experiment scripts importing the original FLUX helper.
+prepare_flux_teacher_references = prepare_teacher_references

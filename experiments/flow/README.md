@@ -79,6 +79,7 @@ accelerate launch --num_processes 1 --num_machines 1 --mixed_precision bf16 -m m
 # Qwen, four steps
 accelerate launch --num_processes 1 --num_machines 1 --mixed_precision bf16 -m main.train_flow \
   --model_family qwen_image21 --manifest experiments/flow/mixed.jsonl \
+  --student_schedule_policy qwen-no-terminal-sigmas-v1 \
   --task mixed --num_steps 4 --output_dir outputs/qwen-4step
 
 # Qwen, one step
@@ -109,6 +110,12 @@ Useful flags:
 - `--fake_warmup_iters 200` delays the first student update until 200 fake-only updates finish.
 - `--rollout_mode stochastic` predicts a clean image and adds fresh noise between steps, matching FastVideo DMD training/inference. The generic default remains `euler`; exports preserve the selected mode for inference.
 - `--score_noise_sampling shifted --score_noise_shift 8` matches FastVideo's modular Wan score-noise sampler: uniform integer timesteps over the scheduler's training range, then sigma=8u/(1+7u), without an extra sigma clamp. Both critic training and normalized DMD scoring use it. The generic default remains the earlier uniform sigma.02-.98 sampler.
+- `--dmd_guidance_mode decoupled` follows Decoupled DMD (Liu et al., 2025): conditional distribution matching against the critic, plus a separate `(w-1)(cond-uncond)` CFG-augmentation term scored at its own independently drawn sigma. `--cfg_term_weight` scales that term (0 gives pure distribution matching) and `--cfg_noise_min/--cfg_noise_max` map the score-noise sampler into a sub-range for it. The default `combined` keeps the original objective. With teacher CFG 1 both modes are identical.
+- `--gen_cls_loss_weight/--guidance_cls_loss_weight` add DMD2's diffusion-GAN loss (Qwen Image 2.1 T2I, single GPU), ported from the authors' SD/SDXL code (`main/sd_guidance.py`, `main/train_sd.py`; their SDXL recipes use `5e-3`/`1e-2`). The discriminator shares the fake-score backbone: like the authors' `classify_forward`, which stops after the UNet mid block, it runs the first `--gan_feature_block` transformer blocks (default half the depth). A head shaped like the SDXL `cls_pred_branch` maps the target-image tokens to one logit. Real and generated latents are noised at a uniform DDPM timestep below `--diffusion_gan_max_timestep`, converted to the flow sigma with the same SNR under the SD/SDXL betas. The generator turn backpropagates only into the student, and the classifier trains with the critic's optimizer. `tests/test_flow_gan.py` checks the losses, the head and the noise against the authors' own `SDGuidance`.
+- `--gan_gradient_diagnostics_every 100` records separate DMD and GAN gradient norms at the student output in `gan_gradient_diagnostics.jsonl`, including the weighted GAN/DMD ratio and gradient cosine. Measurements use the first record of the first microbatch on the first and every 100th student update. They are latent gradients, not parameter gradients or batch averages; diagnostics preserve the ordinary combined backward and are disabled by default.
+- Real photos for the GAN come from the authors' published LAION SDXL latents (`data/laion_vae_latents/sdxl_vae_latents_laion_500k/vae_latents_NNN.pt` on `tianweiy/DMD2`, about 8,000 images per shard). `python -m main.prepare_flow_real_latents --shards vae_latents_000.pt ... --output_dir data/laion-real/qwen_image21` decodes them with the SDXL VAE and re-encodes them with the Qwen VAE. Each image keeps the caption it was published with. Shards are read with a numpy-only unpickler. Pass the outputs as `--gan_real_latents`.
+- Validation summaries record HSV saturation mean/p95 and the clipped-pixel fraction per image, and `color_drift_vs_teacher` (student minus teacher reference, averaged) in `summary.json` and `validation_checks.jsonl`. It is report-only and does not gate.
+- `scripts/run_qwen_image21_t2i.py --override=--FLAG=VALUE` (repeatable) replaces or appends one `train_flow` flag for ablations.
 - `--student_ema_decay .98` enables FastVideo-style student EMA from the start, updated every outer iteration, including critic-only iterations. Validation uses averaged weights; `student-ema/` contains the averaged inference export while `student/` retains raw weights. EMA state and counters resume with checkpoints. EMA is disabled by default in the generic CLI.
 - `--pilot_fixed_noise` separates rollout, step-selection, DMD-scoring and fake-scoring random streams for controlled fresh quality pilots.
 - `--sampling_precision native` uses the pinned FLUX pipeline's carry/timestep rounding; exports preserve this policy. The default `fp32` preserves the previous backend behavior.
@@ -150,6 +157,10 @@ accelerate launch --num_processes 1 --num_machines 1 --mixed_precision bf16 -m m
 
 Resume restores student/fake weights, optimizers, RNG state, and iteration counters.
 It rejects changes to model, schedule, conditioning data, world size, or update settings.
+Runs with periodic validation can resume when the original validation manifest,
+seeds, interval, and untrained `validation-000000` baseline are preserved. GAN
+continuations also restore the discriminator and real-photo sampler; older GAN
+checkpoints reconstruct the sampler position by replaying its deterministic draws.
 Checkpoint directories include training state; student exports do not. When both trainable
 models use LoRA, compact checkpoints store both adapters and optimizer/RNG state without
 duplicating the frozen base transformers. Existing full Accelerate checkpoints remain loadable.
@@ -194,6 +205,76 @@ Raw weights remain in `student/`. Checkpoints also contain EMA state, both
 optimizers, LR schedules and RNG state. Run `python3 -m main.audit_flow_validation
 --help` for the completed-run artifact audit. Training losses and learned quality
 metrics are not substitutes for held-out image review.
+
+### Qwen Image 2.1 at 1024×1024
+
+Use the same repository captions and optimizer recipe with Qwen's resolution-dependent
+four-step sigma grid, student terminal stretching disabled, and teacher CFG 2.5:
+
+```bash
+python3 -u scripts/run_qwen_image21_t2i.py \
+  --data_dir data/repo-t2i --output_dir outputs/qwen-image21-t2i-4step \
+  --model_cache_dir "${HF_HUB_CACHE:-$HOME/.cache/huggingface/hub}"
+```
+
+The complete pinned Qwen Image 2.1 checkpoint must already be available in that
+Hub cache. The supervisor loads it offline in place. Student and critic both use
+rank64/alpha8 LoRAs, LR5e-5, effective batch8, clipping10 and500 outer iterations
+of LR warm-up. It trains10,000 critic/2,000 student updates using stochastic
+transitions, shift8 score-noise sampling and EMA0.98. This carries forward the
+existing recipe; it does not add a GAN or change the objective.
+
+The supervisor explicitly uses `--student_schedule_policy qwen-no-terminal-sigmas-v1`.
+At 1024×1024 the student sigmas are approximately `[1, .8572, .6668, .4001, 0]`.
+This disables `shift_terminal` on a separate student scheduler; the native teacher
+scheduler retains `shift_terminal=0.02`. Exports store the policy and exact trained
+grid, including when generating at a new resolution. Existing checkpoints retain
+their original policy and saved grid; resuming across policies is rejected.
+The generic training CLI defaults to the legacy policy for checkpoint compatibility;
+pass the Qwen policy explicitly when launching four-step Qwen training directly.
+
+References use native40-step Qwen inference with `true_cfg_scale=2.5` and an empty
+negative prompt, which enables guidance. Student inference uses CFG1. Fixed
+comparisons include the full prompt and seed; original PNGs remain1024×1024.
+The supervisor records heartbeats, stage, update counts and measured training ETA
+in `run_status.json`. Visual artifact warnings do not stop training.
+
+The Qwen supervisor accepts `--resume_checkpoint RUN/checkpoint-NNNNNN` to continue
+into a **new** output directory. Keep the same recipe overrides and set
+`--override=--train_iters=10000` for a total budget of 10,000 critic updates,
+including updates already completed. It reuses the original baseline, teacher
+references and validation history. `--after_run OTHER_RUN` queues execution until
+that run completes training, audit and final evaluation and its supervisor exits.
+Queued runs archive their planned command and source hashes before waiting.
+
+```bash
+HF_HUB_CACHE="${HF_HUB_CACHE:-$HOME/.cache/huggingface/hub}" \
+  python3 -m demo.flow_image \
+  --checkpoint outputs/qwen-image21-t2i-4step/student-ema \
+  --prompt "A ceramic teapot on a wooden table beside a sunlit window" \
+  --num_steps 4 --height 1024 --width 1024 --seed 42 \
+  --output outputs/qwen-teapot.png
+```
+
+To queue dedicated one-step FLUX T2I training after another supervised run:
+
+```bash
+python3 -u scripts/run_flux_klein_t2i.py --num_steps 1 \
+  --after_run outputs/flux-klein-t2i \
+  --data_dir data/repo-t2i --output_dir outputs/flux-klein-t2i-1step
+```
+
+The queue process uses no GPU while waiting. It starts after the preceding run
+finishes training, artifact auditing and final evaluation, and its supervisor exits.
+The pending output contains `run_status.json` (stage `queued`) and
+`planned_training_command.json`. A failed or interrupted predecessor is reported
+as a dependency error instead of launching overlapping training.
+
+The one-step run initializes student and critic from the same pinned base teacher,
+uses the same optimizer/data/EMA recipe and update budget, and trains the direct
+sigma1-to0 mapping. Periodic validation and final evaluation also use one step;
+their comparison labels and metadata record the actual step count. Generate from
+its `student-ema/` export with `--num_steps 1` after a checkpoint has been saved.
 
 ## HQ-Edit I2I run
 

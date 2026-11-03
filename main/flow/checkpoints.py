@@ -6,6 +6,8 @@ import shutil
 
 import torch
 
+from .adapters import QWEN_DISTILL_SCHEDULE_POLICY, SCHEDULE_POLICIES
+
 
 def configure_trainable(model, mode, rank=32, alpha=32, gradient_checkpointing=True):
     if mode == 'lora':
@@ -56,8 +58,10 @@ def read_export_config(directory):
     if not path.is_file():
         raise ValueError(f'Expected a student export containing {path.name}: {directory}')
     config = json.loads(path.read_text())
-    if config.get('format_version') != 1 or config.get('schedule_policy') != 'native-linear-sigmas-v1':
+    if config.get('format_version') != 1 or config.get('schedule_policy') not in SCHEDULE_POLICIES:
         raise ValueError('Unsupported flow checkpoint format or sampling policy')
+    if config['schedule_policy'] == QWEN_DISTILL_SCHEDULE_POLICY and config['family'] != 'qwen_image21':
+        raise ValueError('The Qwen student schedule policy requires qwen_image21')
     return config
 
 
@@ -123,6 +127,8 @@ def prune_checkpoints(output_dir, keep, run_id):
 def load_export(adapter, directory, config=None):
     from safetensors.torch import load_file
     config = config or read_export_config(directory)
+    adapter.schedule_policy = config['schedule_policy']
+    adapter.saved_schedules = config.get('schedules', {})
     adapter.sampling_precision = config.get('sampling_precision', 'fp32')
     if adapter.sampling_precision not in ('fp32', 'native'):
         raise ValueError('Unsupported sampling precision policy')

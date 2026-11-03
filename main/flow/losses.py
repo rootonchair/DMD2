@@ -103,12 +103,56 @@ def sample_student(adapter, student, sample, num_steps, generator=None):
     return state
 
 
+def normalized_direction(student_clean, target_clean, direction, epsilon=1e-6):
+    """Scale a clean-space direction by DMD's per-sample |student - target| normalizer."""
+    dims = tuple(range(1, student_clean.ndim))
+    scale = (student_clean.float() - target_clean.float()).abs().mean(dims, keepdim=True)
+    return torch.nan_to_num(direction.float() / scale.clamp_min(epsilon))
+
+
+def cfg_term_sigma(adapter, batch_size, device, generator=None):
+    """Independent CFG-augmentation noise level, mapped into [cfg_noise_min, cfg_noise_max]."""
+    low, high = getattr(adapter, 'cfg_noise_min', 0.0), getattr(adapter, 'cfg_noise_max', 1.0)
+    return low + (high - low) * sample_score_sigma(adapter, batch_size, device, generator)
+
+
+def decoupled_gradient(adapter, teacher, fake, clean, sample, guidance_scale, sigma, noise, generator=None):
+    """Decoupled DMD (Liu et al., 2025): the CFG target splits into a conditional
+    distribution-matching term and a (w-1)(cond-uncond) CFG-augmentation term.
+
+    The CFG term is scored at its own independently drawn noise level, so its
+    weight and sigma range can be tuned separately from distribution matching.
+    """
+    noisy = interpolate(clean, noise, sigma)
+    cond_clean = reconstruct_clean(noisy, adapter.predict(teacher, noisy, sigma, sample['condition']), sigma)
+    fake_clean = reconstruct_clean(noisy, adapter.predict(fake, noisy, sigma, sample['condition']), sigma)
+    gradient = normalized_direction(clean, cond_clean, fake_clean - cond_clean)
+    weight = getattr(adapter, 'cfg_term_weight', 1.0)
+    if guidance_scale > 1 and weight > 0:
+        cfg_sigma = cfg_term_sigma(adapter, clean.shape[0], clean.device, generator)
+        cfg_noisy = interpolate(clean, torch.randn(clean.shape, device=clean.device, generator=generator), cfg_sigma)
+        cond_v, uncond_v = adapter.predict(teacher, cfg_noisy, cfg_sigma, sample['condition'], return_branches=True)
+        cfg_cond = reconstruct_clean(cfg_noisy, cond_v, cfg_sigma)
+        cfg_uncond = reconstruct_clean(cfg_noisy, uncond_v, cfg_sigma)
+        guided = cfg_uncond + guidance_scale * (cfg_cond - cfg_uncond)
+        augmentation = -(guidance_scale - 1) * (cfg_cond - cfg_uncond)
+        gradient = gradient + weight * normalized_direction(clean, guided, augmentation)
+    return gradient
+
+
 def distillation_loss(adapter, student, teacher, fake, sample, num_steps, guidance_scale, generator=None,
-                      scoring_generator=None, selected_step=None):
+                      scoring_generator=None, selected_step=None, keep_graph=False):
+    """keep_graph returns the differentiable student sample, for losses added on the same generator turn."""
     clean = student_clean_sample(adapter, student, sample, num_steps, generator, selected_step)
     scoring_generator = generator if scoring_generator is None else scoring_generator
     sigma = sample_score_sigma(adapter, clean.shape[0], clean.device, scoring_generator)
     noise = torch.randn(clean.shape, device=clean.device, generator=scoring_generator)
+    if getattr(adapter, 'dmd_guidance_mode', 'combined') == 'decoupled':
+        with torch.no_grad():
+            gradient = decoupled_gradient(adapter, teacher, fake, clean.detach().float(), sample, guidance_scale,
+                                          sigma, noise, scoring_generator)
+            target = clean.detach().float() - gradient
+        return 0.5 * F.mse_loss(clean.float(), target), clean if keep_graph else clean.detach(), gradient
     with torch.no_grad():
         noisy = interpolate(clean.detach(), noise, sigma)
         teacher_v = adapter.predict(teacher, noisy, sigma, sample['condition'], guidance_scale)
@@ -116,4 +160,4 @@ def distillation_loss(adapter, student, teacher, fake, sample, num_steps, guidan
         teacher_clean = reconstruct_clean(noisy, teacher_v, sigma)
         fake_clean = reconstruct_clean(noisy, fake_v, sigma)
     loss, gradient = distribution_matching_loss(clean, teacher_clean, fake_clean)
-    return loss, clean.detach(), gradient
+    return loss, clean if keep_graph else clean.detach(), gradient

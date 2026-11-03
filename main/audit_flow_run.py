@@ -76,6 +76,22 @@ def audit_checkpoint(directory, expected_updates):
             raise ValueError('EMA export weights differ from the saved EMA state')
         result['student_ema'] = dict(decay=ema['decay'], updates=ema['num_updates'], finite=True,
                                     export_matches_shadow=True)
+    if config.get('use_gan'):
+        head_index = 1 if config.get('student_ema_decay', 0) else 0
+        head = torch.load(directory / f'custom_checkpoint_{head_index}.pkl', map_location='cpu', weights_only=True)
+        if not head or not all(torch.isfinite(value).all() for value in head.values()):
+            raise ValueError('Discriminator head is missing or nonfinite')
+        result['discriminator'] = dict(tensors=len(head), finite=True)
+        sampler_path = directory / 'real_sampler_rng.pt'
+        if sampler_path.exists():
+            sampler = torch.load(sampler_path, map_location='cpu', weights_only=True)
+            expected_draws = expected_updates * config['gradient_accumulation_steps'] * config['batch_size'] * bool(config['guidance_cls_loss_weight'])
+            if sampler['draws'] != expected_draws or sampler['examples'] < 1:
+                raise ValueError('Real-photo sampler counter differs from completed training')
+            torch.Generator().set_state(sampler['state'])
+            result['real_sampler'] = dict(draws=sampler['draws'], examples=sampler['examples'], saved=True)
+        else:
+            result['real_sampler'] = dict(saved=False, restore_method='legacy_replay')
     return result
 
 

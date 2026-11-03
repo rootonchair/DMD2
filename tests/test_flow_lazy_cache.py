@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import torch
+import pytest
 
 from main.flow.data import OnDemandConditioning, cache_key
 
@@ -57,3 +58,30 @@ def test_t2i_validation_comparison_contains_teacher_current_and_full_prompt(tmp_
         assert layout['panels'][0]['label'] == 'Teacher, 50 steps'
         assert image.getpixel((10,layout['image_y']+10)) == (220,100,80)
         assert image.getpixel((522,layout['image_y']+10)) == (100,120,140)
+
+
+@pytest.mark.parametrize('steps', [1, 4])
+def test_validation_uses_and_labels_trained_step_count(steps, tmp_path, monkeypatch):
+    from PIL import Image
+    from main.flow.validation import evaluate_student
+    class Adapter:
+        device = torch.device('cpu')
+        def decode(self, *args):
+            return Image.new('RGB', (512, 512), (100, 120, 140))
+        def offload_encoders(self):
+            pass
+    observed = []
+    def sample(adapter, model, condition, count, generator):
+        observed.append(count)
+        return torch.zeros(1, 4, 8)
+    monkeypatch.setattr('main.flow.losses.sample_student', sample)
+    model = torch.nn.Linear(1, 1)
+    record = dict(prompt='A ceramic teapot', reference_images=[])
+    result = evaluate_student(Adapter(), model, [{}], [record], tmp_path, [42, 43],
+                              weight_source='ema', num_steps=steps)
+    assert observed == [steps, steps]
+    assert result['student_steps'] == steps
+    for row in result['results']:
+        assert row['student_steps'] == steps
+        expected = f'Student EMA, {steps} step' + ('s' if steps != 1 else '')
+        assert row['comparison']['panels'][-1]['label'] == expected

@@ -10,7 +10,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler, Flux2Transformer2DModel, QwenImage21Transformer2DModel
 from PIL import Image
 
-from main.flow.adapters import FlowAdapter
+from main.flow.adapters import FlowAdapter, NATIVE_SCHEDULE_POLICY, QWEN_DISTILL_SCHEDULE_POLICY
 from main.flow.checkpoints import (configure_trainable, export_model, load_export, read_export_config,
                                   prune_checkpoints, register_compact_lora_hooks)
 from main.flow.data import cache_key, prepare_cache, read_manifest
@@ -363,6 +363,59 @@ def test_published_scheduler_settings(family, steps):
         assert float(sigmas[-2]) == pytest.approx(0.02, abs=1e-6)
 
 
+@pytest.mark.parametrize('policy', [NATIVE_SCHEDULE_POLICY, QWEN_DISTILL_SCHEDULE_POLICY])
+def test_qwen_student_schedule_export_preserves_teacher_and_new_resolutions(tmp_path, policy):
+    adapter = synthetic_adapter('qwen_image21', tiny_model('qwen_image21'))
+    adapter.schedule_policy = policy
+    adapter.pipe.scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True,
+        base_shift=.5, max_shift=.9, base_image_seq_len=256, max_image_seq_len=8192, shift_terminal=.02)
+    teacher_scheduler = adapter.pipe.scheduler
+    teacher_scheduler.set_timesteps(40, mu=.6935483870967742)
+    teacher_sigmas = teacher_scheduler.sigmas.clone()
+    sample = dict(height=1024, width=1024, shape=[1, 4096, 4])
+    sigmas = adapter.schedule(sample, 4)
+    expected = ([1, .7667093277, .4556137323, .02, 0] if policy == NATIVE_SCHEDULE_POLICY
+                else [1, .8571919203, .6667557955, .4000962973, 0])
+    assert sigmas.tolist() == pytest.approx(expected, abs=1e-6)
+    assert adapter.pipe.scheduler is teacher_scheduler
+    assert teacher_scheduler.config.shift_terminal == .02
+    assert torch.equal(teacher_scheduler.sigmas, teacher_sigmas)
+    metadata = dict(adapter.metadata(), schedules={'1024x1024:4': sigmas.tolist()}, num_steps=4)
+    assert metadata['scheduler_config']['shift_terminal'] == .02
+    student = configure_trainable(adapter.load_transformer(), 'lora', 2, 2)
+    export_model(student, tmp_path / 'student', metadata, 'lora')
+    # Reset both state fields, as a fresh inference adapter would start.
+    adapter.schedule_policy = NATIVE_SCHEDULE_POLICY
+    adapter.saved_schedules = {'stale': [1, 0]}
+    load_export(adapter, tmp_path / 'student')
+    assert adapter.schedule_policy == policy
+    assert adapter.saved_schedules == metadata['schedules']
+    assert torch.equal(adapter.schedule(sample, 4), sigmas)
+    # An unseen resolution must follow the exported policy, not just its saved grid.
+    other = dict(height=512, width=512, shape=[1, 1024, 4])
+    other_sigmas = adapter.schedule(other, 4)
+    assert float(other_sigmas[-2]) == pytest.approx(.02 if policy == NATIVE_SCHEDULE_POLICY else .3635699939, abs=1e-6)
+    assert not torch.equal(other_sigmas, sigmas)
+    assert torch.equal(teacher_scheduler.sigmas, teacher_sigmas)
+    assert adapter.schedule(sample, 1).tolist() == [1, 0]
+
+
+def test_qwen_schedule_policy_resume_compatibility():
+    args = vars(parse_args(['--model_family', 'qwen_image21', '--manifest', 'unused', '--output_dir', 'unused']))
+    legacy = dict(args)
+    legacy.pop('student_schedule_policy')
+    resume_config_matches(legacy, args)
+    corrected = dict(args, student_schedule_policy=QWEN_DISTILL_SCHEDULE_POLICY)
+    resume_config_matches(corrected, corrected)
+    with pytest.raises(ValueError, match='student_schedule_policy'):
+        resume_config_matches(legacy, corrected)
+    with pytest.raises(ValueError, match='student_schedule_policy'):
+        resume_config_matches(corrected, args)
+    with pytest.raises(SystemExit):
+        parse_args(['--model_family', 'flux_klein', '--manifest', 'unused', '--output_dir', 'unused',
+                    '--student_schedule_policy', QWEN_DISTILL_SCHEDULE_POLICY])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 @pytest.mark.parametrize('family', ['flux_klein', 'qwen_image21'])
 @pytest.mark.parametrize('steps', [1, 4])
@@ -451,8 +504,9 @@ def test_cuda_training_accumulation_and_resume(family, steps, warmup, fastvideo,
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-@pytest.mark.parametrize('objective', ['normalized', 'raw_flow_kl', 'stochastic', 'fastvideo'])
-def test_cuda_pilot_warmup_and_artifact_warning_does_not_stop_training(objective, tmp_path, monkeypatch):
+@pytest.mark.parametrize('objective,steps', [('normalized', 1), ('normalized', 4), ('raw_flow_kl', 4),
+    ('stochastic', 1), ('stochastic', 4), ('fastvideo', 1), ('fastvideo', 4)])
+def test_cuda_pilot_warmup_and_artifact_warning_does_not_stop_training(objective, steps, tmp_path, monkeypatch):
     class TestAdapter(FlowAdapter):
         def __init__(self, family, model_id, revision, device, teacher_guidance=None):
             base = tiny_model(family).to(torch.bfloat16)
@@ -470,6 +524,7 @@ def test_cuda_pilot_warmup_and_artifact_warning_does_not_stop_training(objective
     monkeypatch.setattr('main.train_flow.FlowAdapter', TestAdapter)
     evaluations = []
     def verdict(*args, **kwargs):
+        assert kwargs['num_steps'] == steps
         if objective == 'fastvideo' and evaluations:
             assert kwargs['weight_source'] == 'ema'
         evaluations.append(args[-1] if len(args) == 8 else None)
@@ -488,6 +543,7 @@ def test_cuda_pilot_warmup_and_artifact_warning_does_not_stop_training(objective
         extra = ['--rollout_mode', 'stochastic', '--score_noise_sampling', 'shifted',
                  '--student_ema_decay', '.98']
     entry(['--model_family', 'flux_klein', '--model_id', 'synthetic-base', '--task', 'i2i',
+                '--num_steps', str(steps),
                 '--manifest', str(manifest), '--output_dir', str(output), '--train_iters', '8',
                 '--lora_rank', '2', '--lora_alpha', '2', '--gradient_accumulation_steps', '2',
                 '--fake_warmup_iters', '3', '--fake_gen_ratio', '2', '--validation_manifest', str(manifest),

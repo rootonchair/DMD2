@@ -10,7 +10,7 @@ import json
 from PIL import Image, ImageDraw, ImageOps
 import torch
 
-from .comparisons import save_comparison
+from .comparisons import save_comparison, native_teacher_steps
 
 
 def image_statistics(image):
@@ -20,8 +20,27 @@ def image_statistics(image):
     codes = quantized[:, :, 0] * 1024 + quantized[:, :, 1] * 32 + quantized[:, :, 2]
     largest_bin = np.bincount(codes.reshape(-1), minlength=32768).max() / codes.size
     luminance = rgb[:, :, 0] * .2126 + rgb[:, :, 1] * .7152 + rgb[:, :, 2] * .0722
+    # HSV saturation; the tail and channel clipping expose DMD/CFG over-saturation
+    # that leaves the mean nearly unchanged.
+    high, low = rgb.max(-1).astype(np.float32), rgb.min(-1).astype(np.float32)
+    saturation = np.where(high > 0, (high - low) / np.maximum(high, 1), 0)
+    clipped = ((rgb <= 5) | (rgb >= 250)).any(-1)
     return dict(cyan_fraction=float(cyan.mean()), largest_color_bin=float(largest_bin),
-                mean_luminance=float(luminance.mean()), luminance_std=float(luminance.std()))
+                mean_luminance=float(luminance.mean()), luminance_std=float(luminance.std()),
+                saturation_mean=float(saturation.mean()), saturation_p95=float(np.percentile(saturation, 95)),
+                clipped_fraction=float(clipped.mean()))
+
+
+COLOR_DRIFT_KEYS = ('saturation_mean', 'saturation_p95', 'clipped_fraction', 'luminance_std')
+
+
+def color_drift(results):
+    """Mean student-minus-teacher color statistics over samples with teacher references."""
+    rows = [row for row in results if row.get('teacher_statistics')]
+    if not rows:
+        return None
+    return {key: float(np.mean([row['statistics'][key] - row['teacher_statistics'][key] for row in rows]))
+            for key in COLOR_DRIFT_KEYS}
 
 
 def artifact_reasons(current, baseline):
@@ -37,7 +56,7 @@ def artifact_reasons(current, baseline):
 
 @torch.no_grad()
 def evaluate_student(adapter, student, samples, records, directory, seeds, baseline=None, teacher_references=None,
-                     weight_source='raw'):
+                     weight_source='raw', num_steps=4):
     from .losses import sample_student
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -50,7 +69,7 @@ def evaluate_student(adapter, student, samples, records, directory, seeds, basel
             for index, (sample, record) in enumerate(zip(samples, records)):
                 for seed in seeds:
                     generator = torch.Generator(device=adapter.device).manual_seed(seed)
-                    latents = sample_student(adapter, student, sample, 4, generator)
+                    latents = sample_student(adapter, student, sample, num_steps, generator)
                     if not torch.isfinite(latents).all():
                         raise FloatingPointError('Nonfinite held-out student latents')
                     image = adapter.decode(latents, sample)
@@ -66,29 +85,40 @@ def evaluate_student(adapter, student, samples, records, directory, seeds, basel
                     else:
                         panels = []
                     teacher_reference = teacher_map.get((index, seed))
+                    teacher_stats = None
                     if teacher_reference is not None:
-                        if teacher_reference['prompt'] != record['prompt'] or teacher_reference['teacher_steps'] != 50:
-                            raise ValueError('Teacher comparison must match this prompt and use 50 steps')
+                        steps = native_teacher_steps(getattr(adapter, 'family', 'flux_klein'))
+                        if teacher_reference['prompt'] != record['prompt'] or teacher_reference['teacher_steps'] != steps:
+                            raise ValueError(f'Teacher comparison must match this prompt and use {steps} steps')
                         with Image.open(teacher_reference['image']) as teacher_image:
-                            panels.append(('Teacher, 50 steps', teacher_image.convert('RGB')))
+                            label = f'Teacher, {steps} steps'
+                            if hasattr(adapter, 'teacher_guidance'):
+                                label += f', CFG {adapter.teacher_guidance}'
+                            panels.append((label, teacher_image.convert('RGB')))
+                            teacher_stats = image_statistics(teacher_image)
                     elif original is not None:
                         with Image.open(original['image']) as base:
-                            panels.append(('Initial student, 4 steps', base.convert('RGB')))
-                    panels.append(('Student EMA, 4 steps' if weight_source == 'ema' else 'Student, 4 steps', image))
+                            panels.append((f'Initial student, {num_steps} step' + ('s' if num_steps != 1 else ''), base.convert('RGB')))
+                    label = 'Student EMA' if weight_source == 'ema' else 'Student'
+                    panels.append((f'{label}, {num_steps} step' + ('s' if num_steps != 1 else ''), image))
                     layout = save_comparison(directory / f'{index:03d}-seed{seed}-comparison.png',
                         panels, record['prompt'], seed, int(directory.name.split('-')[-1]) if directory.name.split('-')[-1].isdigit() else None)
                     if teacher_reference is not None:
-                        layout.update(teacher_image=teacher_reference['image'], teacher_steps=50)
+                        layout.update(teacher_image=teacher_reference['image'], teacher_steps=teacher_reference['teacher_steps'])
+                        if hasattr(adapter, 'teacher_guidance'):
+                            layout['teacher_guidance'] = adapter.teacher_guidance
                     results.append(dict(index=index, seed=seed, prompt=record['prompt'], weight_source=weight_source,
+                        student_steps=num_steps,
                         reference_images=record['reference_images'], image=str((directory / filename).resolve()),
-                        statistics=stats, artifact_reasons=reasons, comparison=layout,
+                        statistics=stats, teacher_statistics=teacher_stats, artifact_reasons=reasons, comparison=layout,
                         latent_mean=float(latents.float().mean()), latent_std=float(latents.float().std()),
                         latent_absmax=float(latents.float().abs().max())))
     finally:
         student.train(previous_mode)
         adapter.offload_encoders()
-    result = dict(completed=True, examples=len(records), samples=len(results),
-                  artifact_gate_passed=not any(row['artifact_reasons'] for row in results), results=results,
+    result = dict(completed=True, examples=len(records), samples=len(results), student_steps=num_steps,
+                  artifact_gate_passed=not any(row['artifact_reasons'] for row in results),
+                  color_drift_vs_teacher=color_drift(results), results=results,
                   scope='Automatic rejection of obvious artifacts relative to the untrained base; visual generation-quality review is still required.')
     (directory / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
     return result

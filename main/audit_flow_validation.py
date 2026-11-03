@@ -12,6 +12,7 @@ import torch
 from main.audit_flow_run import audit_checkpoint
 from main.flow.data import cache_key, read_manifest
 from main.flow.validation import artifact_reasons, image_statistics
+from main.flow.comparisons import native_teacher_steps
 
 
 def audit_pilot(directory):
@@ -68,6 +69,8 @@ def audit_pilot(directory):
             raise ValueError(f'Incomplete validation at {path}')
         rejected = False
         for position, (row, expected_record) in enumerate(zip(result['results'], expected_records)):
+            if row.get('student_steps', 4) != config['num_steps']:
+                raise ValueError('Validation used a different student step count than training')
             index, seed = expected_record
             if (row['index'], row['seed']) != expected_record or row['prompt'] != validation[index]['prompt'] or row['reference_images'] != validation[index]['reference_images']:
                 raise ValueError(f'Validation inputs differ at {path}, record {position}')
@@ -77,10 +80,10 @@ def audit_pilot(directory):
             with Image.open(image_path) as image:
                 image.verify()
             with Image.open(image_path) as image:
-                if image.size != (512, 512):
+                if image.size != (validation[index]['width'], validation[index]['height']):
                     raise ValueError('Unexpected validation output dimensions')
                 actual_stats = image_statistics(image)
-                pixels = np.asarray(image.convert('RGB'))
+                pixels = np.asarray(ImageOps.pad(image.convert('RGB'), (512, 512)))
             for name, value in actual_stats.items():
                 if abs(row['statistics'][name] - value) > 1e-8:
                     raise ValueError('Stored artifact statistics differ from actual image pixels')
@@ -112,9 +115,10 @@ def audit_pilot(directory):
                     if teacher_path:
                         teacher_report = json.loads((Path(teacher_path).parent / 'summary.json').read_text())
                         identity = teacher_report['identity']
-                        if layout.get('teacher_steps') != 50 or identity['teacher_steps'] != 50 or any(
+                        steps = native_teacher_steps(export['family'])
+                        if layout.get('teacher_steps') != steps or identity['teacher_steps'] != steps or any(
                             identity[name] != config[name] for name in ['model_id','revision','teacher_guidance']):
-                            raise ValueError('Comparison teacher differs from the trained base/CFG or 50-step protocol')
+                            raise ValueError('Comparison teacher differs from the trained base/CFG or native step protocol')
                         teacher_row = next(r for r in teacher_report['results'] if (r['index'],r['seed']) == expected_record)
                         if teacher_row['prompt'] != row['prompt'] or teacher_row['image'] != teacher_path:
                             raise ValueError('Comparison uses a teacher from a different prompt')
